@@ -1,0 +1,21 @@
+{
+  "name": "mysticlands-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MysticLands smart contracts on Polygon: Plant and Land NFTs, NFT Shop (Chainlink VRF + POL/USD), POL Marketplace, Reward Pool, Revenue Splitter and LE Shop.",
+  "license": "BUSL-1.1",
+  "type": "commonjs",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "coverage": "hardhat coverage"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.29.1"
+  },
+  "dependencies": {
+    "@chainlink/contracts": "^1.5.0",
+    "@openzeppelin/contracts": "^5.6.1"
+  }
+}
