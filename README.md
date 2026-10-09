@@ -5,7 +5,7 @@
 [![Solidity](https://img.shields.io/badge/Solidity-0.8.28-363636?style=flat-square&logo=solidity)](https://soliditylang.org)
 [![OpenZeppelin](https://img.shields.io/badge/OpenZeppelin-5-4e5ee4?style=flat-square&logo=openzeppelin&logoColor=white)](https://openzeppelin.com/contracts)
 [![Chainlink](https://img.shields.io/badge/Chainlink-VRF%20v2.5%20%2B%20POL%2FUSD-375bd2?style=flat-square&logo=chainlink&logoColor=white)](https://docs.chain.link)
-[![Tests](https://img.shields.io/badge/tests-35%20passing-brightgreen?style=flat-square)](test)
+[![Tests](https://img.shields.io/badge/tests-38%20passing-brightgreen?style=flat-square)](test)
 [![License](https://img.shields.io/badge/license-BUSL--1.1-blue?style=flat-square)](LICENSE)
 
 Solidity contracts behind [MysticLands](https://mysticlands.online), an NFT farming game on **Polygon**.
@@ -14,7 +14,7 @@ Inside the game everything runs on **Light Energy (LE)**; outside it, on **POL**
 The source is public so that players, auditors and partners can verify exactly what runs on-chain.
 This repository only contains the contracts the game uses today.
 
-> **Status:** live on Polygon mainnet, unit-tested (including attack tests), **not externally audited yet**.
+> **Status:** live on Polygon mainnet, source verified on Polygonscan, unit-tested (including attack tests), **not externally audited yet**.
 
 ## Deployed contracts (Polygon mainnet, chainId 137)
 
@@ -22,7 +22,7 @@ This repository only contains the contracts the game uses today.
 |---|---|
 | [`MysticPlant`](src/MysticPlant.sol) | [`0xCa9d11FED6AE3648995debcD1370E6410CFa4353`](https://polygonscan.com/address/0xCa9d11FED6AE3648995debcD1370E6410CFa4353) |
 | [`MysticLand`](src/MysticLand.sol) | [`0xC4C3f702CBf10397f54Ec124A8e0cABbd763D632`](https://polygonscan.com/address/0xC4C3f702CBf10397f54Ec124A8e0cABbd763D632) |
-| [`MysticNftShop`](src/MysticNftShop.sol) | [`0x60b0454e729BAF2a9C92784dFf9dB8f3CAEc202c`](https://polygonscan.com/address/0x60b0454e729BAF2a9C92784dFf9dB8f3CAEc202c) |
+| [`MysticNftShop`](src/MysticNftShop.sol) | [`0x2AeFDD1ed933cdB85c640F44A00a795e910522a4`](https://polygonscan.com/address/0x2AeFDD1ed933cdB85c640F44A00a795e910522a4) |
 | [`MysticMarketPol`](src/MysticMarketPol.sol) | [`0x7F73A683a7f58FE33e4f3aFc27Ade3b71d1C3d0E`](https://polygonscan.com/address/0x7F73A683a7f58FE33e4f3aFc27Ade3b71d1C3d0E) |
 | [`MysticRewardPool`](src/MysticRewardPool.sol) | [`0xE4BB51b46595a982dc6851525dD492bC155Cddba`](https://polygonscan.com/address/0xE4BB51b46595a982dc6851525dD492bC155Cddba) |
 | [`MysticRevenueSplitter`](src/MysticRevenueSplitter.sol) | [`0xF5E7aEBe00ec396d2aE9933D326410c6cC952390`](https://polygonscan.com/address/0xF5E7aEBe00ec396d2aE9933D326410c6cC952390) |
@@ -36,7 +36,7 @@ Owner of all contracts: `0xba7ee74892A8AEa45a64e3ce611B96a136D59352` · Treasury
 |---|---|---|
 | `MysticPlant` | ERC-721 | Plant (species 0-39) and Mother Tree (species 90-93) NFTs. Species, variant, rarity and DNA stored on-chain. Capped supply. |
 | `MysticLand` | ERC-721 | Land NFTs on a 201 × 201 map. Every cell can only be owned once. Capped at 10,000 lands. |
-| `MysticNftShop` | Chainlink VRF v2.5 + Data Feed | Sells seeds, starter kits, lands and bundles for POL. Prices are set in US dollars and charged in POL through the Chainlink POL/USD feed. Random results come from Chainlink VRF; NFTs are minted on `claim`. Mother Trees are never sold directly: each seed has a 2% chance (`motherBps`). Seeds earned in the game are redeemed with server-signed vouchers (EIP-712, daily limit). |
+| `MysticNftShop` | Chainlink VRF v2.5 + Data Feed | Sells seeds, starter kits, lands and bundles for POL. Prices are set in US dollars and charged in POL through the Chainlink POL/USD feed. Seeds **germinate for 24 hours before anything is drawn**: the purchase only records the order and `germinate()` asks Chainlink VRF for the random word afterwards, so nobody can know the result early, not even by reading the chain. NFTs are minted on `claim`. Mother Trees are never sold directly: each seed has a 1% chance (`motherBps`). Seeds earned in the game are redeemed with server-signed vouchers (EIP-712, daily limit). |
 | `MysticMarketPol` | — | Fixed-price, non-custodial marketplace paid in POL. Fee capped at 10% and locked per listing. If a seller's wallet refuses POL, the amount is held for the seller to `withdraw`. |
 | `MysticRevenueSplitter` | — | Every POL payment from the shops and the marketplace lands here and is split on arrival: 60% treasury / 40% Reward Pool (pool share bounded between 20% and 60%). Holds nothing. |
 | `MysticRewardPool` | EIP-712 | Holds the POL used for in-game rewards. Players exchange LE for POL with a claim signed by the game server. At most `dailyBps` of the balance (1%, never above 5%) can be paid per UTC day, plus a per-wallet daily limit. |
@@ -44,7 +44,7 @@ Owner of all contracts: `0xba7ee74892A8AEa45a64e3ce611B96a136D59352` · Treasury
 | `GameNFT` | — | Shared base: supply cap, `MINTER_ROLE`, irreversible `freezeMinters()`. |
 
 ```
- Player ── POL ──► MysticNftShop ──► Chainlink VRF ──► claim() ──► MysticPlant / MysticLand
+ Player ── POL ──► MysticNftShop ── 24h ──► germinate() ──► Chainlink VRF ──► claim() ──► MysticPlant / MysticLand
    │                     │
    ├── POL ──► MysticLEShop                 (all POL payments)
    │                     │                         │
@@ -86,7 +86,7 @@ MysticLands is a game: nothing here is an investment or a promise of gains.
 
 ```bash
 npm install
-npm test            # 35 tests (including attack tests)
+npm test            # 38 tests (including attack tests)
 npm run coverage    # coverage report
 ```
 

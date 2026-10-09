@@ -14,12 +14,13 @@ import {MysticLand} from "./MysticLand.sol";
 /// @title MysticLands NFT Shop
 /// @notice Sells seeds, starter kits, lands and bundles for POL. Prices are set in US dollars and charged
 ///         in POL through the Chainlink POL/USD feed. Every POL goes straight to the treasury (the revenue
-///         splitter: 60% treasury / 40% reward pool); the contract holds no funds.
-///         Randomness comes from Chainlink VRF v2.5: the buyer pays, a random word is requested and, once
-///         Chainlink answers, anyone calls {claim} to mint the NFTs to the buyer.
+///         splitter); the contract holds no funds.
+///         Seeds germinate for {GROW_TIME} before anything is drawn: the purchase only records the order,
+///         and the Chainlink VRF random word is requested by {germinate} once the seed is grown. So nobody,
+///         not even by reading the blockchain, can know what a seed will become while it germinates.
+///         After Chainlink answers, anyone calls {claim} and the NFTs are minted to the buyer.
 ///         Mother Trees are never sold directly: every seed has a small chance (`motherBps`) to grow into one.
-/// @dev Same order layout, {claim}, {retryRandomness} and seed vouchers as the first MysticSeedShop, so the
-///      game client keeps working. Pay in ML is not supported.
+///         Orders with lands only (no seeds) can be germinated right away.
 contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGuard {
     struct Product {
         uint256 usdPrice; // US dollars with 8 decimals (1e8 = $1)
@@ -28,13 +29,16 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
         bool active;
     }
 
+    /// @dev The first five fields keep the layout of the first shop (buyer, plants, lands, minted, ready).
     struct Order {
         address buyer;
         uint16 plants;
         uint16 lands;
         uint16 minted;
         bool ready;
-        uint64 requestedAt;
+        uint64 plantedAt;
+        uint64 requestedAt; // 0 = random word not requested yet (still germinating)
+        uint256 vrfRequestId;
         uint256 seed;
     }
 
@@ -49,7 +53,8 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
     uint256 public constant MAX_ITEMS_PER_ORDER = 300;
     uint16 public constant MAX_VOUCHER_SEEDS = 50;
     uint256 public constant RETRY_DELAY = 1 days;
-    uint256 public constant MAX_MOTHER_BPS = 1_000; // nunca mais que 10% das sementes viram Mother Tree
+    uint256 public constant GROW_TIME = 1 days;
+    uint256 public constant MAX_MOTHER_BPS = 1_000; // nunca mais que 10% das seeds viram Mother Tree
 
     MysticPlant public immutable plants;
     MysticLand public immutable lands;
@@ -57,12 +62,17 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
     address public treasury;
     AggregatorV3Interface public priceFeed;
     uint256 public maxStaleness = 1 days;
-    /// @notice Chance (in basis points) of each seed becoming a Mother Tree. 200 = 2%.
-    uint256 public motherBps = 200;
+    /// @notice Chance (in basis points) of each seed becoming a Mother Tree. 100 = 1%.
+    uint256 public motherBps = 100;
     VrfConfig public vrf;
+    uint256 public orderCount;
 
     mapping(uint256 productId => Product) public products;
-    mapping(uint256 requestId => Order) public orders;
+    mapping(uint256 orderId => Order) public orders;
+    mapping(uint256 vrfRequestId => uint256 orderId) public orderOfRequest;
+    // pedidos em aberto de cada jogador (o jogo le direto do contrato)
+    mapping(address buyer => uint256[]) private _open;
+    mapping(uint256 orderId => uint256 indexPlusOne) private _openIndex;
 
     bytes32 public constant SEED_VOUCHER_TYPEHASH =
         keccak256("SeedVoucher(address player,uint16 quantity,uint256 nonce,uint256 deadline)");
@@ -71,16 +81,17 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
     mapping(uint256 day => uint256 seeds) public voucherSeedsOnDay;
     mapping(uint256 nonce => bool) public voucherUsed;
 
-    event Purchased(address indexed buyer, uint256 indexed requestId, uint256 indexed productId, uint16 quantity, uint256 polPaid);
-    event RandomnessFulfilled(uint256 indexed requestId);
-    event RandomnessRetried(uint256 indexed oldRequestId, uint256 indexed newRequestId);
-    event OrderClaimed(uint256 indexed requestId, address indexed buyer, uint16 minted, bool completed);
+    event Purchased(address indexed buyer, uint256 indexed orderId, uint256 indexed productId, uint16 quantity, uint256 polPaid);
+    event Germinated(uint256 indexed orderId, uint256 indexed vrfRequestId);
+    event RandomnessFulfilled(uint256 indexed orderId);
+    event RandomnessRetried(uint256 indexed orderId, uint256 indexed newVrfRequestId);
+    event OrderClaimed(uint256 indexed orderId, address indexed buyer, uint16 minted, bool completed);
     event ProductUpdated(uint256 indexed productId, uint256 usdPrice, uint16 plants, uint16 lands, bool active);
     event TreasuryUpdated(address treasury);
     event PricingUpdated(address feed, uint256 maxStaleness);
     event MotherChanceUpdated(uint256 motherBps);
     event VrfConfigUpdated(uint256 subscriptionId, bytes32 keyHash, uint32 callbackGasLimit, uint16 requestConfirmations);
-    event SeedVoucherRedeemed(address indexed player, uint256 indexed requestId, uint16 quantity, uint256 nonce);
+    event SeedVoucherRedeemed(address indexed player, uint256 indexed orderId, uint16 quantity, uint256 nonce);
     event SeedSignerUpdated(address signer, uint256 dailyLimit);
 
     error InvalidQuantity();
@@ -92,9 +103,11 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
     error NativeTransferFailed();
     error UnknownOrder();
     error NotReady();
+    error StillGerminating(uint256 readyAt);
+    error AlreadyGerminated();
+    error NotGerminated();
     error AlreadyFulfilled();
     error TooEarly();
-    error NotBuyer();
     error VoucherExpired();
     error VoucherUsed();
     error InvalidVoucher();
@@ -110,11 +123,11 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
         treasury = treasury_;
         priceFeed = AggregatorV3Interface(feed);
         vrf = vrf_;
-        _setProduct(1, 3e8, 1, 0, true); // semente: 1 planta (ou Mother Tree, por sorte)
-        _setProduct(2, 13e8, 6, 0, true); // kit inicial: 6 sementes
+        _setProduct(1, 10e8, 1, 0, true); // seed: 1 planta (ou Mother Tree, por sorte)
+        _setProduct(2, 17e8, 2, 0, true); // kit inicial: 2 seeds
         _setProduct(3, 100e8, 0, 1, true); // terreno aleatorio
-        _setProduct(4, 150e8, 30, 1, true); // Efficient: 30 sementes + 1 terreno
-        _setProduct(5, 500e8, 90, 3, true); // Landlord: 90 sementes + 3 terrenos
+        _setProduct(4, 150e8, 10, 1, true); // Efficient: 10 seeds + 1 terreno
+        _setProduct(5, 500e8, 25, 3, true); // Landlord: 25 seeds + 3 terrenos
     }
 
     // ---------------------------------------------------------------- prices
@@ -126,14 +139,27 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
         (, int256 answer,, uint256 updatedAt,) = priceFeed.latestRoundData();
         if (answer <= 0) revert InvalidPrice();
         if (block.timestamp - updatedAt > maxStaleness) revert StalePrice();
-        // usdPrice e answer (POL/USD) tem 8 casas: POL = usd / (POL/USD)
         return (p.usdPrice * 1e18) / uint256(answer);
+    }
+
+    // ---------------------------------------------------------------- reading
+
+    /// @notice When an order can be germinated (seeds: {GROW_TIME} after purchase; lands only: right away).
+    function readyAt(uint256 orderId) public view returns (uint256) {
+        Order memory o = orders[orderId];
+        if (o.buyer == address(0)) revert UnknownOrder();
+        return o.plants == 0 ? o.plantedAt : uint256(o.plantedAt) + GROW_TIME;
+    }
+
+    /// @notice Open orders of a player (germinating, waiting for Chainlink or partially minted).
+    function openOrdersOf(address buyer) external view returns (uint256[] memory) {
+        return _open[buyer];
     }
 
     // ---------------------------------------------------------------- purchases
 
     /// @notice Buys `quantity` units of a product. Send at least {priceInPol} x quantity; any excess is returned.
-    function buy(uint256 productId, uint16 quantity) external payable whenNotPaused nonReentrant returns (uint256 requestId) {
+    function buy(uint256 productId, uint16 quantity) external payable whenNotPaused nonReentrant returns (uint256 orderId) {
         Product memory p = products[productId];
         if (!p.active) revert InvalidProduct();
         uint256 items = (uint256(p.plants) + p.lands) * quantity;
@@ -141,18 +167,18 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
         uint256 cost = priceInPol(productId) * quantity;
         if (msg.value < cost) revert Underpaid(msg.value, cost);
 
-        requestId = _openOrder(msg.sender, uint16(uint256(p.plants) * quantity), uint16(uint256(p.lands) * quantity));
+        orderId = _newOrder(msg.sender, uint16(uint256(p.plants) * quantity), uint16(uint256(p.lands) * quantity));
         _send(treasury, cost);
         if (msg.value > cost) _send(msg.sender, msg.value - cost);
-        emit Purchased(msg.sender, requestId, productId, quantity, cost);
+        emit Purchased(msg.sender, orderId, productId, quantity, cost);
     }
 
-    /// @notice Turns seeds earned in the game into a random-plant order, using a voucher signed by the game server.
+    /// @notice Turns seeds earned in the game into an order, using a voucher signed by the game server.
     function redeemSeedVoucher(uint16 quantity, uint256 nonce, uint256 deadline, bytes calldata signature)
         external
         whenNotPaused
         nonReentrant
-        returns (uint256 requestId)
+        returns (uint256 orderId)
     {
         if (quantity == 0 || quantity > MAX_VOUCHER_SEEDS) revert InvalidQuantity();
         if (block.timestamp > deadline) revert VoucherExpired();
@@ -166,14 +192,25 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
         voucherSeedsOnDay[day] = used + quantity;
         voucherUsed[nonce] = true;
 
-        requestId = _openOrder(msg.sender, quantity, 0);
-        emit SeedVoucherRedeemed(msg.sender, requestId, quantity, nonce);
+        orderId = _newOrder(msg.sender, quantity, 0);
+        emit SeedVoucherRedeemed(msg.sender, orderId, quantity, nonce);
+    }
+
+    /// @notice After the seeds have grown, asks Chainlink for the random word. Anyone can call it.
+    function germinate(uint256 orderId) external whenNotPaused nonReentrant {
+        Order storage o = orders[orderId];
+        if (o.buyer == address(0)) revert UnknownOrder();
+        if (o.requestedAt != 0) revert AlreadyGerminated();
+        uint256 at = readyAt(orderId);
+        if (block.timestamp < at) revert StillGerminating(at);
+        _request(orderId, o);
+        emit Germinated(orderId, o.vrfRequestId);
     }
 
     /// @notice Mints up to `maxItems` NFTs of a fulfilled order to its buyer. Anyone can call it.
     ///         Lands are minted first, then plants. Call again until the order is completed.
-    function claim(uint256 requestId, uint16 maxItems) external nonReentrant {
-        Order storage o = orders[requestId];
+    function claim(uint256 orderId, uint16 maxItems) external nonReentrant {
+        Order storage o = orders[orderId];
         if (o.buyer == address(0)) revert UnknownOrder();
         if (!o.ready) revert NotReady();
 
@@ -196,32 +233,35 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
         }
 
         bool completed = end == total;
-        if (completed) delete orders[requestId];
-        emit OrderClaimed(requestId, buyer, uint16(end - start), completed);
+        if (completed) {
+            _close(buyer, orderId);
+            delete orders[orderId];
+        }
+        emit OrderClaimed(orderId, buyer, uint16(end - start), completed);
     }
 
-    /// @notice If Chainlink has not answered after {RETRY_DELAY}, the buyer can request a new random word.
-    function retryRandomness(uint256 requestId) external nonReentrant returns (uint256 newRequestId) {
-        Order memory o = orders[requestId];
+    /// @notice If Chainlink has not answered {RETRY_DELAY} after germination, anyone can ask again.
+    function retryRandomness(uint256 orderId) external nonReentrant {
+        Order storage o = orders[orderId];
         if (o.buyer == address(0)) revert UnknownOrder();
-        if (o.buyer != msg.sender) revert NotBuyer();
+        if (o.requestedAt == 0) revert NotGerminated();
         if (o.ready) revert AlreadyFulfilled();
-        if (block.timestamp < o.requestedAt + RETRY_DELAY) revert TooEarly();
-
-        delete orders[requestId];
-        newRequestId = _openOrder(o.buyer, o.plants, o.lands);
-        emit RandomnessRetried(requestId, newRequestId);
+        if (block.timestamp < uint256(o.requestedAt) + RETRY_DELAY) revert TooEarly();
+        delete orderOfRequest[o.vrfRequestId];
+        _request(orderId, o);
+        emit RandomnessRetried(orderId, o.vrfRequestId);
     }
 
     // ---------------------------------------------------------------- VRF
 
     function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal override {
-        Order storage o = orders[requestId];
-        // pedidos desconhecidos ou refeitos sao ignorados: uma resposta atrasada nao pode ser escolhida
-        if (o.buyer == address(0) || o.ready) return;
+        uint256 orderId = orderOfRequest[requestId];
+        Order storage o = orders[orderId];
+        // pedidos desconhecidos, refeitos ou ja respondidos sao ignorados
+        if (orderId == 0 || o.buyer == address(0) || o.ready || o.vrfRequestId != requestId) return;
         o.seed = randomWords[0];
         o.ready = true;
-        emit RandomnessFulfilled(requestId);
+        emit RandomnessFulfilled(orderId);
     }
 
     // ---------------------------------------------------------------- admin
@@ -282,8 +322,27 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
         if (!ok) revert NativeTransferFailed();
     }
 
-    function _openOrder(address buyer, uint16 plantCount, uint16 landCount) private returns (uint256 requestId) {
-        requestId = s_vrfCoordinator.requestRandomWords(
+    function _newOrder(address buyer, uint16 plantCount, uint16 landCount) private returns (uint256 orderId) {
+        orderId = ++orderCount;
+        orders[orderId] = Order(buyer, plantCount, landCount, 0, false, uint64(block.timestamp), 0, 0, 0);
+        _open[buyer].push(orderId);
+        _openIndex[orderId] = _open[buyer].length;
+    }
+
+    // remove o pedido da lista de abertos em O(1)
+    function _close(address buyer, uint256 orderId) private {
+        uint256 index = _openIndex[orderId];
+        if (index == 0) return;
+        uint256[] storage list = _open[buyer];
+        uint256 last = list[list.length - 1];
+        list[index - 1] = last;
+        _openIndex[last] = index;
+        list.pop();
+        delete _openIndex[orderId];
+    }
+
+    function _request(uint256 orderId, Order storage o) private {
+        uint256 requestId = s_vrfCoordinator.requestRandomWords(
             VRFV2PlusClient.RandomWordsRequest({
                 keyHash: vrf.keyHash,
                 subId: vrf.subscriptionId,
@@ -293,7 +352,9 @@ contract MysticNftShop is VRFConsumerBaseV2Plus, EIP712, Pausable, ReentrancyGua
                 extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: vrf.nativePayment}))
             })
         );
-        orders[requestId] = Order(buyer, plantCount, landCount, 0, false, uint64(block.timestamp), 0);
+        o.requestedAt = uint64(block.timestamp);
+        o.vrfRequestId = requestId;
+        orderOfRequest[requestId] = orderId;
     }
 
     /// @dev Especie: com chance `motherBps` vira uma das 4 Mother Trees (90-93); senao, uma das 40 plantas.
