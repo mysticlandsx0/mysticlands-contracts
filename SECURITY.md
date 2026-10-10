@@ -4,7 +4,7 @@
 
 If you find a security issue in the MysticLands contracts, please report it privately:
 
-- **Email:** security@mysticlands.online
+- **Email:** mysticlandsx0@gmail.com
 - Include the affected contract and function, the impact, and steps or a test to reproduce it.
 - Please do not disclose the issue publicly or exploit it on any network until it is fixed.
 
